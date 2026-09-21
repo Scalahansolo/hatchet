@@ -1,8 +1,10 @@
 import { DurableTaskResponse } from '@hatchet/protoc/v1/dispatcher';
+import { ActionListener } from '@hatchet/clients/dispatcher/action-listener';
 import { HatchetClient } from '../client';
 import { TenantClient } from '../features/tenant';
 import { DurableEvictionManager } from './eviction/eviction-manager';
 import { InternalWorker } from './worker-internal';
+import { HealthServer } from './health-server';
 
 function gate() {
   let release = () => {};
@@ -26,7 +28,7 @@ describe('durable worker shutdown', () => {
     jest.spyOn(TenantClient.prototype, 'get').mockRejectedValue(new Error('No test engine'));
     const claims = Buffer.from(
       JSON.stringify({
-        sub: 'test-tenant',
+        sub: 'shutdown-serialization-subject',
         server_url: 'http://localhost:1',
         grpc_broadcast_address: 'localhost:1',
       })
@@ -92,6 +94,83 @@ describe('durable worker shutdown', () => {
     }
     jest.useRealTimers();
     jest.restoreAllMocks();
+  });
+
+  it('unregisters a listener acquired after shutdown completes', async () => {
+    const registration = gate();
+    const listener = new ActionListener(client.dispatcher, 'late-worker');
+    const unregister = jest
+      .spyOn(listener, 'unregister')
+      .mockResolvedValue({ tenantId: client.tenantId, workerId: listener.workerId });
+    const actions = jest.spyOn(listener, 'actions').mockImplementation(async function* () {
+      yield* [];
+    });
+    const getListener = jest
+      .spyOn(client.dispatcher, 'getActionListener')
+      .mockImplementation(async () => {
+        await registration.promise;
+        return listener;
+      });
+    worker.action_registry['waiting-task'] = () => {};
+
+    const starting = worker.start();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(getListener).toHaveBeenCalledTimes(1);
+    await worker.stop();
+    expect(unregister).not.toHaveBeenCalled();
+
+    registration.release();
+    await starting;
+    await worker.stop();
+
+    expect(unregister).toHaveBeenCalledTimes(1);
+    expect(actions).not.toHaveBeenCalled();
+  });
+
+  it.each(['before-start', 'workflow-registration'])(
+    'does not acquire a listener after stop: %s',
+    async (phase) => {
+      const registration = gate();
+      const getListener = jest
+        .spyOn(client.dispatcher, 'getActionListener')
+        .mockRejectedValue(new Error('Unexpected listener registration'));
+      worker.action_registry['waiting-task'] = () => {};
+      worker.registeredWorkflowPromises.push(registration.promise);
+
+      if (phase === 'before-start') {
+        await worker.stop();
+      }
+      const starting = worker.start();
+      await worker.stop();
+      registration.release();
+      await starting;
+
+      expect(getListener).not.toHaveBeenCalled();
+    }
+  );
+
+  it('closes a health server whose startup finishes after shutdown', async () => {
+    const healthReady = gate();
+    let healthListening = false;
+    jest.spyOn(HealthServer.prototype, 'start').mockImplementation(async () => {
+      await healthReady.promise;
+      healthListening = true;
+    });
+    jest.spyOn(HealthServer.prototype, 'stop').mockImplementation(async () => {
+      healthListening = false;
+    });
+    client.config.healthcheck = { enabled: true, port: 8001 };
+    const startingWorker = new InternalWorker(client, {
+      name: 'health-startup',
+      handleKill: false,
+    });
+    const starting = startingWorker.start();
+    await startingWorker.stop();
+
+    healthReady.release();
+    await starting;
+
+    expect(healthListening).toBe(false);
   });
 
   it('resolves concurrent eviction requests from one acknowledgement', async () => {

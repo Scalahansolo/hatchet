@@ -902,11 +902,19 @@ export class InternalWorker {
   }
 
   async start() {
+    if (this.killing) {
+      return;
+    }
     this.setStatus(workerStatus.STARTING);
 
     if (this.healthServer) {
       try {
         await this.healthServer.start();
+        if (this.killing) {
+          await this.shutdownPromise;
+          await this.healthServer.stop();
+          return;
+        }
       } catch (e: any) {
         this.logger.error(`Could not start health server: ${e.message}`);
         this.setStatus(workerStatus.UNHEALTHY);
@@ -917,12 +925,18 @@ export class InternalWorker {
     // ensure all workflows are registered
     await Promise.all(this.registeredWorkflowPromises);
 
-    if (Object.keys(this.action_registry).length === 0) {
+    if (this.killing || Object.keys(this.action_registry).length === 0) {
       return;
     }
 
     try {
-      this.listener = await this.createListener();
+      const listener = await this.createListener();
+      if (this.killing) {
+        // Shutdown cannot clean up a listener that registration has not returned yet.
+        await listener.unregister();
+        return;
+      }
+      this.listener = listener;
 
       this.workerId = this.listener.workerId;
       this.setStatus(workerStatus.HEALTHY);
